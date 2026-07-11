@@ -1,27 +1,17 @@
 """
 Data Quality Monitor - Multi-Agent System
 Deployed on Maritime.sh
+
+Ultra-lightweight version: no pandas, no litellm, no crewai.
+Just flask + groq + pure Python.
 """
-import litellm
-litellm.drop_params = True
 
 import os
-os.environ["LITELLM_DROP_PARAMS"] = "true"
-
-_original_completion = litellm.completion
-def _patched_completion(*args, **kwargs):
-    if "messages" in kwargs:
-        for msg in kwargs["messages"]:
-            if isinstance(msg, dict):
-                msg.pop("cache_breakpoint", None)
-                msg.pop("cache_control", None)
-    return _original_completion(*args, **kwargs)
-litellm.completion = _patched_completion
-
 import json
-import logging
+import csv
 import io
-import pandas as pd
+import logging
+import statistics
 from flask import Flask, request, jsonify
 from groq import Groq
 
@@ -36,53 +26,73 @@ def get_groq():
     return Groq(api_key=os.environ.get("GROQ_API_KEY"))
 
 
-# ─── AGENT 1: COLLECTOR ───
+# ─── AGENT 1: COLLECTOR (pure Python) ───
 def collector_agent(csv_text):
-    """Parse CSV and compute statistics. Pure Python, no LLM needed."""
+    """Parse CSV and compute statistics without pandas."""
     try:
-        df = pd.read_csv(io.StringIO(csv_text))
+        reader = csv.DictReader(io.StringIO(csv_text))
+        rows = list(reader)
     except Exception as e:
         return {"error": f"Failed to parse CSV: {str(e)}"}
 
+    if not rows:
+        return {"error": "CSV is empty"}
+
+    columns = list(rows[0].keys())
     stats = {
-        "row_count": len(df),
-        "column_count": len(df.columns),
+        "row_count": len(rows),
+        "column_count": len(columns),
         "columns": {},
         "potential_issues": []
     }
 
-    for col in df.columns:
+    for col in columns:
+        values = [r[col] for r in rows]
+        null_count = sum(1 for v in values if v is None or v.strip() == "")
+        non_null = [v.strip() for v in values if v is not None and v.strip() != ""]
+
         col_stats = {
-            "dtype": str(df[col].dtype),
-            "null_count": int(df[col].isna().sum()),
-            "null_percentage": round(df[col].isna().sum() / len(df) * 100, 2),
-            "unique_values": int(df[col].nunique()),
+            "null_count": null_count,
+            "null_percentage": round(null_count / len(rows) * 100, 2),
+            "unique_values": len(set(non_null)),
         }
 
-        if pd.api.types.is_numeric_dtype(df[col]):
-            col_stats["min"] = float(df[col].min()) if not df[col].isna().all() else None
-            col_stats["max"] = float(df[col].max()) if not df[col].isna().all() else None
-            col_stats["mean"] = round(float(df[col].mean()), 2) if not df[col].isna().all() else None
-            col_stats["std"] = round(float(df[col].std()), 2) if not df[col].isna().all() else None
+        # Try numeric parsing
+        numeric_vals = []
+        for v in non_null:
+            try:
+                numeric_vals.append(float(v))
+            except ValueError:
+                pass
 
-            if col_stats["std"] and col_stats["std"] > 0:
+        if len(numeric_vals) > len(non_null) * 0.5:
+            col_stats["type"] = "numeric"
+            col_stats["min"] = min(numeric_vals)
+            col_stats["max"] = max(numeric_vals)
+            col_stats["mean"] = round(statistics.mean(numeric_vals), 2)
+            if len(numeric_vals) > 1:
+                col_stats["std"] = round(statistics.stdev(numeric_vals), 2)
+
+                # Outliers
                 mean = col_stats["mean"]
                 std = col_stats["std"]
-                outliers = df[(df[col] < mean - 3 * std) | (df[col] > mean + 3 * std)]
-                if len(outliers) > 0:
-                    col_stats["outlier_count"] = len(outliers)
-                    stats["potential_issues"].append(
-                        f"Column '{col}' has {len(outliers)} outliers beyond 3 standard deviations"
-                    )
+                if std > 0:
+                    outliers = [v for v in numeric_vals if v < mean - 3 * std or v > mean + 3 * std]
+                    if outliers:
+                        col_stats["outlier_count"] = len(outliers)
+                        col_stats["outlier_values"] = outliers[:5]
+                        stats["potential_issues"].append(
+                            f"Column '{col}' has {len(outliers)} outliers beyond 3 std devs (e.g. {outliers[0]})"
+                        )
 
-            if df[col].min() < 0:
-                neg_count = int((df[col] < 0).sum())
-                col_stats["negative_count"] = neg_count
-                stats["potential_issues"].append(
-                    f"Column '{col}' has {neg_count} negative values"
-                )
+            # Negative values
+            neg = [v for v in numeric_vals if v < 0]
+            if neg:
+                col_stats["negative_count"] = len(neg)
+                stats["potential_issues"].append(f"Column '{col}' has {len(neg)} negative values")
         else:
-            col_stats["sample_values"] = df[col].dropna().head(3).tolist()
+            col_stats["type"] = "text"
+            col_stats["sample_values"] = non_null[:3]
 
         if col_stats["null_percentage"] > 5:
             stats["potential_issues"].append(
@@ -91,20 +101,20 @@ def collector_agent(csv_text):
 
         stats["columns"][col] = col_stats
 
-    dupe_count = int(df.duplicated().sum())
+    # Duplicates
+    row_strings = [json.dumps(r, sort_keys=True) for r in rows]
+    dupe_count = len(row_strings) - len(set(row_strings))
     if dupe_count > 0:
         stats["duplicate_rows"] = dupe_count
         stats["potential_issues"].append(f"Found {dupe_count} duplicate rows")
 
-    log.info(f"[Collector] Computed stats for {len(df.columns)} columns, {len(df)} rows")
+    log.info(f"[Collector] Stats for {len(columns)} columns, {len(rows)} rows")
     return stats
 
 
-# ─── AGENT 2: ANALYZER (uses LLM) ───
+# ─── AGENT 2: ANALYZER (LLM) ───
 def analyzer_agent(stats):
-    """Send stats to LLM for anomaly detection."""
     client = get_groq()
-
     response = client.chat.completions.create(
         model="llama-3.3-70b-versatile",
         messages=[{
@@ -114,7 +124,7 @@ def analyzer_agent(stats):
 STATISTICS:
 {json.dumps(stats, indent=2)}
 
-For each issue, return a JSON array of objects with:
+For each issue return a JSON array of objects with:
 - "check_type": category (missing_data, outlier, negative_values, duplicates, trend_anomaly)
 - "severity": "critical", "warning", or "info"
 - "description": clear explanation
@@ -135,13 +145,12 @@ Return ONLY valid JSON array. No markdown, no backticks, no preamble."""
         findings = [{"check_type": "parse_error", "severity": "warning",
                      "description": "Could not parse LLM response", "recommended_fix": "Review manually"}]
 
-    log.info(f"[Analyzer] Found {len(findings)} quality issues")
+    log.info(f"[Analyzer] Found {len(findings)} issues")
     return findings
 
 
 # ─── AGENT 3: REPORTER ───
 def reporter_agent(findings):
-    """Format findings into a structured report. Pure Python."""
     severity_counts = {"critical": 0, "warning": 0, "info": 0}
     for f in findings:
         sev = f.get("severity", "info").lower()
@@ -150,6 +159,7 @@ def reporter_agent(findings):
 
     report = {
         "report_type": "Data Quality Analysis",
+        "agents_used": ["Collector (stats)", "Analyzer (LLM anomaly detection)", "Reporter (formatting)"],
         "summary": {
             "total_issues": len(findings),
             "critical": severity_counts["critical"],
@@ -162,12 +172,12 @@ def reporter_agent(findings):
         "findings": findings
     }
 
-    log.info(f"[Reporter] Report: {severity_counts['critical']} critical, "
+    log.info(f"[Reporter] {severity_counts['critical']} critical, "
              f"{severity_counts['warning']} warnings, {severity_counts['info']} info")
     return report
 
 
-# ─── CHAT MODE ───
+# ─── CHAT ───
 def handle_chat(question):
     client = get_groq()
     response = client.chat.completions.create(
@@ -195,30 +205,21 @@ def invoke():
         return jsonify({"mode": "chat", "answer": answer})
 
     if "csv_data" in data:
-        csv_data = data["csv_data"]
-        log.info(f"Received CSV data ({len(csv_data)} chars)")
-
+        log.info(f"Received CSV data ({len(data['csv_data'])} chars)")
         try:
-            # Agent 1: Collect stats
-            stats = collector_agent(csv_data)
+            stats = collector_agent(data["csv_data"])
             if "error" in stats:
                 return jsonify({"error": stats["error"]}), 400
-
-            # Agent 2: Analyze with LLM
             findings = analyzer_agent(stats)
-
-            # Agent 3: Format report
             report = reporter_agent(findings)
-
             latest_report = report
             return jsonify({"mode": "analysis", "report": report})
-
         except Exception as e:
             log.error(f"Pipeline failed: {str(e)}")
             return jsonify({"error": str(e)}), 500
 
     return jsonify({
-        "error": "Send either 'csv_data' for analysis or 'question' for chat",
+        "error": "Send 'csv_data' for analysis or 'question' for chat",
         "usage": {
             "analyze": {"csv_data": "col1,col2\\nval1,val2\\n..."},
             "chat": {"question": "What are the most critical issues?"}
