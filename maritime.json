@@ -1,0 +1,5 @@
+{
+  "name": "dq-agent",
+  "template": "custom",
+  "env": []
+}

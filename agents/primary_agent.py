@@ -193,6 +193,13 @@ def handle_chat(question):
     )
     return response.choices[0].message.content
 
+@app.route("/", methods=["GET"])
+def index():
+    return jsonify({
+        "status": "online",
+        "service": "Data Quality Monitor",
+        "usage": "Send a POST request to /invoke with your data."
+    }), 200
 
 # ─── ROUTES ───
 @app.route("/invoke", methods=["POST"])
